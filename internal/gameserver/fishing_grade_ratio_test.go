@@ -1,8 +1,22 @@
 package gameserver
 
 import (
+	"context"
 	"testing"
+
+	"rf4server/internal/store"
 )
+
+func enableGradeRatio(t *testing.T, srv *Server, db *store.DB) {
+	t.Helper()
+	if _, err := db.SQL.Exec(`INSERT INTO tunables(key,value) VALUES('grade_ratio_enabled','1')
+		ON CONFLICT(key) DO UPDATE SET value='1'`); err != nil {
+		t.Fatalf("开启档位比例: %v", err)
+	}
+	srv.tunMu.Lock()
+	srv.tunCache = nil
+	srv.tunMu.Unlock()
+}
 
 // gradeRatioGradeOf 用与服务端结算相同的档位线判定口径，把体重折算成档位。
 func gradeRatioGradeOf(w int64, val, tro, sup int64) int64 {
@@ -12,7 +26,8 @@ func gradeRatioGradeOf(w int64, val, tro, sup int64) int64 {
 
 // 档位比例开启时，四档出鱼占比应接近控制台默认值（3 / 87.5 / 9 / 0.5）。
 func TestGradeRatioSamplingMatchesDefaultPercent(t *testing.T) {
-	srv, _ := newDetachTestServer(t)
+	srv, db := newDetachTestServer(t)
+	enableGradeRatio(t, srv, db)
 	const val, tro, sup = int64(1000), int64(5000), int64(8000)
 	lines := cachedGradeLines{val: ptrI64(val), trophy: ptrI64(tro), blue: ptrI64(sup)}
 
@@ -48,6 +63,7 @@ func TestGradeRatioSamplingMatchesDefaultPercent(t *testing.T) {
 // 控制台改比例后应立即生效，且奖杯份额提高会同步压低合格份额。
 func TestGradeRatioSamplingFollowsTunables(t *testing.T) {
 	srv, db := newDetachTestServer(t)
+	enableGradeRatio(t, srv, db)
 	setTunable := func(key, value string) {
 		if _, err := db.SQL.Exec(`INSERT INTO tunables(key,value) VALUES(?,?)
 			ON CONFLICT(key) DO UPDATE SET value=excluded.value`, key, value); err != nil {
@@ -82,7 +98,8 @@ func TestGradeRatioSamplingFollowsTunables(t *testing.T) {
 
 // 鱼种没有奖杯线/蓝冠线时只在可用档位里归一化，不得产生不存在的档位。
 func TestGradeRatioSamplingWithoutTrophyLines(t *testing.T) {
-	srv, _ := newDetachTestServer(t)
+	srv, db := newDetachTestServer(t)
+	enableGradeRatio(t, srv, db)
 	const val = int64(1000)
 	lines := cachedGradeLines{val: ptrI64(val)}
 	for i := 0; i < 500; i++ {
@@ -117,9 +134,69 @@ func TestGradeRatioDisabledReturnsFallback(t *testing.T) {
 
 // 装备上限远够不到该鱼种时按不可钓处理，交给上层换鱼种或空竿。
 func TestGradeRatioUnreachableTrophyWithGearCap(t *testing.T) {
-	srv, _ := newDetachTestServer(t)
+	srv, db := newDetachTestServer(t)
+	enableGradeRatio(t, srv, db)
 	lines := cachedGradeLines{val: ptrI64(1000), trophy: ptrI64(50000), blue: ptrI64(80000)}
 	if w, ok := srv.sampleWeightByGradeRatio(lines, 1, 1, 1000); !ok || w != 0 {
 		t.Fatalf("上限 1kg 够不到 50kg 奖杯线，应返回 (0,true)，实得 (%d,%v)", w, ok)
+	}
+}
+
+// 默认必须关闭，升级后不能静默改变既有出货分布。
+func TestGradeRatioDisabledByDefault(t *testing.T) {
+	srv, _ := newDetachTestServer(t)
+	lines := cachedGradeLines{val: ptrI64(1000), trophy: ptrI64(5000), blue: ptrI64(8000)}
+	if w, ok := srv.sampleWeightByGradeRatio(lines, 1, 1, 0); ok || w != 0 {
+		t.Fatalf("默认应关闭档位比例，实得 (%d,%v)", w, ok)
+	}
+}
+
+// 抽样必须使用与最终判档相同的 settleStatics 线，否则运营比例会在
+// fish_grade_lines.qualified_g 与 Record 重量不一致的鱼种上失真。
+func TestGradeRatioSamplingUsesSettlementGradeLines(t *testing.T) {
+	srv, db := newDetachTestServer(t)
+	ctx := context.Background()
+	enableGradeRatio(t, srv, db)
+	if _, err := db.SQL.Exec(`INSERT INTO species_weight(fish_key) VALUES('crucian')
+		ON CONFLICT(fish_key) DO NOTHING`); err != nil {
+		t.Fatalf("写鱼种: %v", err)
+	}
+	if _, err := db.SQL.Exec(`INSERT INTO fish_grade_lines(fish_key,qualified_g,trophy_g,blue_trophy_g)
+		VALUES('crucian',200,1900,3200)
+		ON CONFLICT(fish_key) DO UPDATE SET qualified_g=200,trophy_g=1900,blue_trophy_g=3200`); err != nil {
+		t.Fatalf("写档位线: %v", err)
+	}
+	setTunable := func(key, value string) {
+		if _, err := db.SQL.Exec(`INSERT INTO tunables(key,value) VALUES(?,?)
+			ON CONFLICT(key) DO UPDATE SET value=excluded.value`, key, value); err != nil {
+			t.Fatalf("写 %s: %v", key, err)
+		}
+	}
+	setTunable("grade_pct_below", "0")
+	setTunable("grade_pct_qualified", "100")
+	setTunable("grade_pct_trophy", "0")
+	setTunable("grade_pct_super", "0")
+	srv.tunMu.Lock()
+	srv.tunCache = nil
+	srv.tunMu.Unlock()
+
+	c := fishRollContext{cache: newFishingRollCache()}
+	ratioLines := srv.cachedGradeLines(ctx, c, "crucian")
+	settle := srv.settleStatics(ctx, "crucian")
+	if ratioLines.val == nil || *ratioLines.val != 200 || settle[0] != 300 {
+		t.Fatalf("测试前提不成立: grade_lines=%v settle=%v", ratioLines, settle)
+	}
+	below := 0
+	for i := 0; i < 2000; i++ {
+		w := srv.sampleWeightDB(ctx, "crucian", 1, 1, 0, c)
+		if w <= 0 {
+			t.Fatalf("第 %d 次抽样没有结果", i)
+		}
+		if srv.rollGradeForRoll(ctx, "crucian", w, c) == 1 {
+			below++
+		}
+	}
+	if below != 0 {
+		t.Fatalf("最终判档使用了抽样线而不是 settleStatics，出现 %d 尾未达标", below)
 	}
 }

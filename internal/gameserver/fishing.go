@@ -960,9 +960,13 @@ func (s *Server) sampleWeightDB(ctx context.Context, key string, modeMult, scale
 		supf = float64(*sup)
 	}
 	// 控制台可配置的档位比例（未达标/合格/奖杯/蓝冠）优先；
-	// 关闭时退回下面的对数正态标定路径。
-	if w, ok := s.sampleWeightByGradeRatio(lines, modeMult, scale, capG); ok {
-		return w
+	// 抽样与最终判档必须共用 settleStatics 同一真源，避免鱼档占比失真。
+	if s.tunableF("grade_ratio_enabled", 0) == 1 {
+		settle := s.cachedSettleStatics(ctx, c, key)
+		ratioLines := cachedGradeLines{val: &settle[0], trophy: &settle[1], blue: &settle[2]}
+		if w, ok := s.sampleWeightByGradeRatio(ratioLines, modeMult, scale, capG); ok {
+			return w
+		}
 	}
 	// 峰值 M：达标带中点（缺 val→tro*0.6→sup*0.3→250）
 	M := 250.0
@@ -1046,7 +1050,7 @@ type gradeRatioBand struct {
 // 返回 (0,false) 表示未启用或没有可用档位，调用方退回对数正态标定；
 // 返回 (0,true) 表示当前钓组够不到该鱼种，按空竿处理。
 func (s *Server) sampleWeightByGradeRatio(l cachedGradeLines, modeMult, scale, capG float64) (int64, bool) {
-	if s.tunableF("grade_ratio_enabled", 1) != 1 {
+	if s.tunableF("grade_ratio_enabled", 0) != 1 {
 		return 0, false
 	}
 	// 缩放参数不可表示（NaN/Inf/<=0）时按"不可钓"处理，避免溢出成 MinInt64。

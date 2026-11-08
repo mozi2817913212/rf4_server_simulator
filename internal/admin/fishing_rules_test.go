@@ -15,7 +15,7 @@ import (
 )
 
 func TestFishingRuleSwitchAPIAndRestart(t *testing.T) {
-	for _, key := range []string{"fish_ecology_enabled", "fish_bait_rules_enabled", "fish_distribution_enabled", "fish_weather_enabled", "happy_hour_enabled"} {
+	for _, key := range []string{"fish_ecology_enabled", "fish_bait_rules_enabled", "fish_distribution_enabled", "fish_weather_enabled", "happy_hour_enabled", "grade_ratio_enabled"} {
 		t.Run(key, func(t *testing.T) { testFishingSwitchAPIAndRestart(t, key) })
 	}
 }
