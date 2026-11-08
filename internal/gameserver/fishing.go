@@ -959,6 +959,11 @@ func (s *Server) sampleWeightDB(ctx context.Context, key string, modeMult, scale
 	if sup != nil {
 		supf = float64(*sup)
 	}
+	// 控制台可配置的档位比例（未达标/合格/奖杯/蓝冠）优先；
+	// 关闭时退回下面的对数正态标定路径。
+	if w, ok := s.sampleWeightByGradeRatio(lines, modeMult, scale, capG); ok {
+		return w
+	}
 	// 峰值 M：达标带中点（缺 val→tro*0.6→sup*0.3→250）
 	M := 250.0
 	switch {
@@ -1027,6 +1032,137 @@ func (s *Server) sampleWeightDB(ctx context.Context, key string, modeMult, scale
 func (s *Server) rollGradeDB(ctx context.Context, key string, weightG int64) int64 {
 	lines := s.settleStatics(ctx, key)
 	return gradeFromLines(&lines[0], &lines[1], &lines[2], weightG)
+}
+
+// gradeRatioBand 一个档位的重量区间（g），下界含、上界开。
+type gradeRatioBand struct {
+	grade  int64
+	lo, hi float64
+}
+
+// sampleWeightByGradeRatio 按控制台配置的档位比例直接抽样体重。
+// 四个比例来自 tunables（grade_pct_below/qualified/trophy/super）；
+// 鱼种缺某一档阈值时，其份额按其余可用档位归一化。
+// 返回 (0,false) 表示未启用或没有可用档位，调用方退回对数正态标定；
+// 返回 (0,true) 表示当前钓组够不到该鱼种，按空竿处理。
+func (s *Server) sampleWeightByGradeRatio(l cachedGradeLines, modeMult, scale, capG float64) (int64, bool) {
+	if s.tunableF("grade_ratio_enabled", 1) != 1 {
+		return 0, false
+	}
+	// 缩放参数不可表示（NaN/Inf/<=0）时按"不可钓"处理，避免溢出成 MinInt64。
+	if math.IsNaN(scale) || math.IsInf(scale, 0) || scale <= 0 {
+		return 0, true
+	}
+	var vf, trof, supf float64
+	if l.val != nil {
+		vf = float64(*l.val)
+	}
+	if l.trophy != nil {
+		trof = float64(*l.trophy)
+	}
+	if l.blue != nil {
+		supf = float64(*l.blue)
+	}
+	lo := 1.0
+	bands := make([]gradeRatioBand, 0, 4)
+	if vf > lo {
+		bands = append(bands, gradeRatioBand{1, lo, vf}) // 未达标
+	}
+	qLo, qHi := lo, 0.0
+	if vf > 0 {
+		qLo = vf
+	}
+	switch {
+	case trof > 0:
+		qHi = trof
+	case supf > 0:
+		qHi = supf * 0.98
+	default:
+		qHi = qLo * 6
+	}
+	if qHi > qLo {
+		bands = append(bands, gradeRatioBand{2, qLo, qHi}) // 合格
+	}
+	if trof > 0 && supf > trof {
+		bands = append(bands, gradeRatioBand{3, trof, supf}) // 奖杯
+	}
+	if supf > 0 {
+		bands = append(bands, gradeRatioBand{4, supf, supf * 1.15}) // 蓝冠
+	}
+	if len(bands) == 0 {
+		return 0, false
+	}
+	// 装备上限远低于该鱼种奖杯线（< 7.2%，与旧标定 lo=M*0.12 同量级）时，
+	// 认为该鱼种在当前钓组下不可钓，交给上层换鱼种或空竿。
+	if capG > 0 {
+		ref := trof
+		if ref <= 0 {
+			ref = supf
+		}
+		if ref > 0 && capG/scale < ref*0.072 {
+			return 0, true
+		}
+	}
+	w := map[int64]float64{
+		1: s.tunableF("grade_pct_below", 3),
+		2: s.tunableF("grade_pct_qualified", 87.5),
+		3: s.tunableF("grade_pct_trophy", 9),
+		4: s.tunableF("grade_pct_super", 0.5),
+	}
+	// 饵效命中：把一部分"合格"份额挪给奖杯，模拟大饵更招大鱼。
+	if modeMult > 1.0 {
+		shift := math.Min(w[2]*0.5, w[2]*(modeMult-1)*0.5)
+		w[2] -= shift
+		w[3] += shift
+	}
+	usable := make([]gradeRatioBand, 0, len(bands))
+	wts := make([]float64, 0, len(bands))
+	total := 0.0
+	for _, b := range bands {
+		if capG > 0 && capG/scale < b.lo*0.999 {
+			continue // 装备上限够不到该档起点
+		}
+		if w[b.grade] <= 0 {
+			continue
+		}
+		usable = append(usable, b)
+		wts = append(wts, w[b.grade])
+		total += w[b.grade]
+	}
+	if len(usable) == 0 || total <= 0 {
+		return 0, false
+	}
+	r := rand.Float64() * total
+	idx := len(usable) - 1
+	for i, ww := range wts {
+		if r < ww {
+			idx = i
+			break
+		}
+		r -= ww
+	}
+	b := usable[idx]
+	a, z := b.lo, b.hi
+	if a < 1 {
+		a = 1
+	}
+	if capG > 0 && z > capG/scale {
+		z = capG / scale
+	}
+	var base float64
+	if z > a*1.0001 {
+		base = math.Exp(math.Log(a) + rand.Float64()*(math.Log(z)-math.Log(a)))
+	} else {
+		base = a
+	}
+	val := math.Max(1, math.Round(base*scale))
+	if capG > 0 && val > capG {
+		val = math.Round(capG)
+	}
+	if math.IsNaN(val) || math.IsInf(val, 0) || val >= float64(math.MaxInt64) {
+		return 0, true
+	}
+	return int64(val), true
 }
 
 func (s *Server) rollGradeForRoll(ctx context.Context, key string, weightG int64, c fishRollContext) int64 {

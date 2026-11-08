@@ -294,6 +294,11 @@ const TUNABLE_DEFS=[
   ['bait_pref_weight_shift','饵效偏大体型',1,'越大越偏向个体大的鱼咬钩'],
   ['fish_weight_scale','鱼体重倍率',1,'全地图鱼重整体缩放，2=两倍重'],
   ['fish_weight_cap','鱼重受钓具上限',0,'1=超出钓具负重的鱼按上限截断；0=不限制'],
+  ['grade_ratio_enabled','档位比例开关',1,'1=按下列比例出鱼；0=退回对数正态标定'],
+  ['grade_pct_below','未达标比例（%）',3,'体重低于合格线的占比'],
+  ['grade_pct_qualified','合格比例（%）',87.5,'合格档占比；缺档位的份额按其余档归一化'],
+  ['grade_pct_trophy','奖杯比例（%）',9,'奖杯档占比'],
+  ['grade_pct_super','蓝冠比例（%）',0.5,'蓝冠档占比'],
   ['fight_power_scale','搏斗拉力倍率',1,'越低鱼挣扎越小、越不易断线；1=原版'],
   ['xp_gain','经验倍率',1,'结算经验整体缩放，1.5=多 50% 经验'],
   ['release_xp_ratio','放生经验比例',0.5,'放生时拿到入护经验的几成，0.5=一半'],
@@ -363,6 +368,7 @@ async function loadTunables(){
   +group('经验与结算','改后只对新结算的鱼生效，已入护的不重算',['xp_gain','release_xp_ratio'])
   +group('钓获掉卡','本地自定概率；最多 30 秒生效，重连或重复结算不补抽',['card_drop_normal','card_drop_star','card_drop_blue','card_drop_rare_scale'])
   +group('钓获礼包','钓上鱼当场开箱，奖励直接进背包并播报',['loot_box_enabled','loot_box_chance','loot_box_trophy_guarantee'])
+  +group('鱼获档位比例','按四档占比出鱼；缺某档阈值时其余档自动归一',['grade_ratio_enabled','grade_pct_below','grade_pct_qualified','grade_pct_trophy','grade_pct_super'])
   +group('聊天通知','跑鱼提示与上钩播报分别设置；保存后最多 30 秒生效',['fish_escape_taunt','fish_hooked_chat']);
 }
 async function saveTunableVal(key,val){
