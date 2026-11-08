@@ -72,7 +72,16 @@ func TestWeatherBrokenHookDoesNotStopOtherHealthyHooks(t *testing.T) {
 		t.Fatal("one broken hook stopped a healthy baited hook")
 	}
 	assertRetry(true)
-	if fish := s.rollFishForRig(ctx, uid, rod.GUID, "unknown-map", "worm_01", neutralFishingSkillBonus()); fish == nil {
+	// 天气鱼口会按概率丢弃单次判鱼，所以这里多试几次：
+	// 真正"一根断钩让整根竿停口"会次次为空，偶发的天气空口不该算失败。
+	rolled := false
+	for i := 0; i < 20; i++ {
+		if fish := s.rollFishForRig(ctx, uid, rod.GUID, "unknown-map", "worm_01", neutralFishingSkillBonus()); fish != nil {
+			rolled = true
+			break
+		}
+	}
+	if !rolled {
 		t.Fatal("one broken hook globally blocked actual roll")
 	}
 	if err := db.SetItemDurability(ctx, hooks[1], 0); err != nil {
